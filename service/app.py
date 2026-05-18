@@ -14,14 +14,15 @@ from PIL import Image
 from pydantic import BaseModel, Field
 from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 
+# Path conventions requested by user
 BASE_DIR = Path(os.getenv("COMFYUI_BASE_DIR", "/data1/w00916456/ComfyUI/ComfyUIDeploy"))
 RESULTS_DIR = Path(os.getenv("RESULTS_DIR", str(BASE_DIR / "results"))).resolve()
 QWEN_MODEL_PATH = os.getenv("QWEN_MODEL_PATH", "/data1/w00916456/Qwen3-VL/Qwen3-VL-32B-Instruct")
 ZIMAGE_MODEL_PATH = os.getenv("ZIMAGE_MODEL_PATH", "/data1/w00916456/Z-Image-main/Z-Image-Turbo")
 DEFAULT_QWEN_GPU_ID = int(os.getenv("DEFAULT_QWEN_GPU_ID", "0"))
-DEFAULT_ZIMAGE_GPU_ID = int(os.getenv("DEFAULT_ZIMAGE_GPU_ID", "0"))
+DEFAULT_ZIMAGE_GPU_ID = int(os.getenv("DEFAULT_ZIMAGE_GPU_ID", "1"))
 
-app = FastAPI(title="Result1 Inference API", version="0.2.0")
+app = FastAPI(title="Result1 API", version="1.0.0")
 
 _state: Dict[str, Any] = {
     "qwen_model": None,
@@ -41,7 +42,6 @@ class InferPathRequest(BaseModel):
     max_new_tokens: int = 1024
     qwen_gpu_id: Optional[int] = None
     zimage_gpu_id: Optional[int] = None
-
     seed: Optional[int] = None
     prompt_override: Optional[str] = None
     negative_prompt: Optional[str] = None
@@ -51,11 +51,11 @@ class InferPathRequest(BaseModel):
     height: Optional[int] = None
 
 
-def _ensure_results_dir() -> None:
+def _ensure_dirs() -> None:
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def _load_qwen_model(device: str) -> None:
+def _load_qwen(device: str) -> None:
     if _state["qwen_model"] is not None and _state["qwen_device"] == device:
         return
     _state["qwen_model"] = Qwen3VLForConditionalGeneration.from_pretrained(
@@ -67,24 +67,107 @@ def _load_qwen_model(device: str) -> None:
     _state["qwen_device"] = device
 
 
-def _load_zimage_model(device: str) -> None:
+def _load_zimage(device: str) -> None:
     if _state["zimage_pipe"] is not None and _state["zimage_device"] == device:
         return
-    zimage_pipe = ZImagePipeline.from_pretrained(
+    pipe = ZImagePipeline.from_pretrained(
         ZIMAGE_MODEL_PATH,
         torch_dtype=torch.bfloat16,
         low_cpu_mem_usage=False,
     )
-    zimage_pipe.to(device)
-    _state["zimage_pipe"] = zimage_pipe
+    pipe.to(device)
+    _state["zimage_pipe"] = pipe
     _state["zimage_device"] = device
 
 
+def _resolve_devices(qwen_gpu_id: Optional[int], zimage_gpu_id: Optional[int]) -> tuple[str, str]:
+    qwen = DEFAULT_QWEN_GPU_ID if qwen_gpu_id is None else qwen_gpu_id
+    zimg = DEFAULT_ZIMAGE_GPU_ID if zimage_gpu_id is None else zimage_gpu_id
+    return f"cuda:{qwen}", f"cuda:{zimg}"
+
+
+def _prepare_image(upload: Optional[UploadFile], image_path: Optional[str]) -> Image.Image:
+    if upload is None and not image_path:
+        raise HTTPException(status_code=400, detail="Provide either image upload or image_path")
+    if upload is not None and image_path:
+        raise HTTPException(status_code=400, detail="Use only one of image/upload or image_path")
+    if upload is not None:
+        return Image.open(io.BytesIO(upload.file.read())).convert("RGB")
+    assert image_path is not None
+    p = Path(image_path)
+    if not p.exists() or not p.is_file():
+        raise HTTPException(status_code=400, detail=f"image_path not found: {image_path}")
+    return Image.open(p).convert("RGB")
+
+
+def _caption(image: Image.Image, user_input: str, min_pixels: int, max_pixels: int, max_new_tokens: int) -> str:
+    processor = _state["processor"]
+    model = _state["qwen_model"]
+    device = _state["qwen_device"]
+
+    messages = [{"role": "user", "content": [
+        {"type": "image", "image": image, "min_pixels": min_pixels, "max_pixels": max_pixels},
+        {"type": "text", "text": user_input},
+    ]}]
+    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    inputs = processor(text=[text], images=[image], return_tensors="pt")
+    inputs = {k: v.to(device) if hasattr(v, "to") else v for k, v in inputs.items()}
+    out_ids = model.generate(**inputs, max_new_tokens=max_new_tokens)
+    trimmed = [o[len(i):] for i, o in zip(inputs["input_ids"], out_ids)]
+    return processor.batch_decode(trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
+
+
+def _generate(
+    image: Image.Image,
+    prompt: str,
+    seed: Optional[int],
+    negative_prompt: Optional[str],
+    guidance_scale: float,
+    num_inference_steps: int,
+    width: Optional[int],
+    height: Optional[int],
+) -> Image.Image:
+    pipe = _state["zimage_pipe"]
+    generator = None
+    if seed is not None:
+        generator = torch.Generator(device=_state["zimage_device"]).manual_seed(seed)
+
+    kwargs: Dict[str, Any] = {
+        "prompt": prompt,
+        "image": image,
+        "guidance_scale": guidance_scale,
+        "num_inference_steps": num_inference_steps,
+    }
+    if negative_prompt:
+        kwargs["negative_prompt"] = negative_prompt
+    if width:
+        kwargs["width"] = width
+    if height:
+        kwargs["height"] = height
+    if generator is not None:
+        kwargs["generator"] = generator
+
+    return pipe(**kwargs).images[0]
+
+
+def _save(img: Image.Image) -> str:
+    out = RESULTS_DIR / f"result1_{int(time.time())}_{uuid.uuid4().hex[:8]}.png"
+    img.save(out)
+    return str(out)
+
+
+def _b64(img: Image.Image) -> str:
+    b = io.BytesIO()
+    img.save(b, format="PNG")
+    return base64.b64encode(b.getvalue()).decode("utf-8")
+
+
 @app.on_event("startup")
-def startup_event() -> None:
-    _ensure_results_dir()
-    _load_qwen_model(f"cuda:{DEFAULT_QWEN_GPU_ID}")
-    _load_zimage_model(f"cuda:{DEFAULT_ZIMAGE_GPU_ID}")
+def _startup() -> None:
+    _ensure_dirs()
+    qd, zd = _resolve_devices(None, None)
+    _load_qwen(qd)
+    _load_zimage(zd)
 
 
 @app.get("/health")
@@ -100,132 +183,13 @@ def health() -> Dict[str, Any]:
         "comfyui_base_dir": str(BASE_DIR),
         "comfyui_base_exists": BASE_DIR.exists(),
         "results_dir": str(RESULTS_DIR),
+        "results_dir_exists": RESULTS_DIR.exists(),
     }
-
-
 
 
 @app.get("/deploy/check")
 def deploy_check() -> Dict[str, Any]:
-    return {
-        "comfyui_base_dir": str(BASE_DIR),
-        "comfyui_base_exists": BASE_DIR.exists(),
-        "results_dir": str(RESULTS_DIR),
-        "results_dir_exists": RESULTS_DIR.exists(),
-        "qwen_model_path": QWEN_MODEL_PATH,
-        "qwen_model_exists": Path(QWEN_MODEL_PATH).exists(),
-        "zimage_model_path": ZIMAGE_MODEL_PATH,
-        "zimage_model_exists": Path(ZIMAGE_MODEL_PATH).exists(),
-        "qwen_device": _state["qwen_device"],
-        "zimage_device": _state["zimage_device"],
-    }
-
-def _open_image_from_upload_or_path(upload: Optional[UploadFile], image_path: Optional[str]) -> Image.Image:
-    if upload is None and not image_path:
-        raise HTTPException(status_code=400, detail="Provide either image file upload or image_path")
-    if upload is not None and image_path:
-        raise HTTPException(status_code=400, detail="Use only one of: upload or image_path")
-
-    if upload is not None:
-        raw = upload.file.read()
-        return Image.open(io.BytesIO(raw)).convert("RGB")
-
-    assert image_path is not None
-    p = Path(image_path)
-    if not p.exists() or not p.is_file():
-        raise HTTPException(status_code=400, detail=f"image_path not found: {image_path}")
-    return Image.open(p).convert("RGB")
-
-
-def _generate_caption(
-    image: Image.Image,
-    user_input: str,
-    min_pixels: int,
-    max_pixels: int,
-    max_new_tokens: int,
-) -> str:
-    processor = _state["processor"]
-    qwen_model = _state["qwen_model"]
-    qwen_device = _state["qwen_device"]
-
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {
-                    "type": "image",
-                    "image": image,
-                    "min_pixels": min_pixels,
-                    "max_pixels": max_pixels,
-                },
-                {"type": "text", "text": user_input},
-            ],
-        }
-    ]
-
-    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    inputs = processor(text=[text], images=[image], return_tensors="pt")
-    inputs = {k: v.to(qwen_device) if hasattr(v, "to") else v for k, v in inputs.items()}
-
-    generated_ids = qwen_model.generate(**inputs, max_new_tokens=max_new_tokens)
-    generated_ids_trimmed = [
-        out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs["input_ids"], generated_ids)
-    ]
-    output_text = processor.batch_decode(
-        generated_ids_trimmed,
-        skip_special_tokens=True,
-        clean_up_tokenization_spaces=False,
-    )
-    return output_text[0]
-
-
-def _run_zimage(
-    prompt: str,
-    init_image: Image.Image,
-    seed: Optional[int],
-    negative_prompt: Optional[str],
-    guidance_scale: float,
-    num_inference_steps: int,
-    width: Optional[int],
-    height: Optional[int],
-) -> Image.Image:
-    pipe = _state["zimage_pipe"]
-    zimage_device = _state["zimage_device"]
-
-    generator = None
-    if seed is not None:
-        generator = torch.Generator(device=zimage_device).manual_seed(seed)
-
-    kwargs: Dict[str, Any] = {
-        "prompt": prompt,
-        "image": init_image,
-        "guidance_scale": guidance_scale,
-        "num_inference_steps": num_inference_steps,
-    }
-    if negative_prompt:
-        kwargs["negative_prompt"] = negative_prompt
-    if width:
-        kwargs["width"] = width
-    if height:
-        kwargs["height"] = height
-    if generator is not None:
-        kwargs["generator"] = generator
-
-    out = pipe(**kwargs)
-    return out.images[0]
-
-
-def _save_result(image: Image.Image) -> str:
-    filename = f"result1_{int(time.time())}_{uuid.uuid4().hex[:8]}.png"
-    output_path = RESULTS_DIR / filename
-    image.save(output_path)
-    return str(output_path)
-
-
-def _image_to_base64(image: Image.Image) -> str:
-    buff = io.BytesIO()
-    image.save(buff, format="PNG")
-    return base64.b64encode(buff.getvalue()).decode("utf-8")
+    return health()
 
 
 @app.post("/infer/result1")
@@ -248,87 +212,48 @@ def infer_result1(
     return_base64: bool = Form(default=False),
 ) -> Dict[str, Any]:
     start = time.time()
-
-    target_qwen_device = f"cuda:{DEFAULT_QWEN_GPU_ID if qwen_gpu_id is None else qwen_gpu_id}"
-    target_zimage_device = f"cuda:{DEFAULT_ZIMAGE_GPU_ID if zimage_gpu_id is None else zimage_gpu_id}"
+    qd, zd = _resolve_devices(qwen_gpu_id, zimage_gpu_id)
 
     with _infer_lock:
-        if _state["qwen_device"] != target_qwen_device:
-            _load_qwen_model(target_qwen_device)
-        if _state["zimage_device"] != target_zimage_device:
-            _load_zimage_model(target_zimage_device)
+        _load_qwen(qd)
+        _load_zimage(zd)
+        src = _prepare_image(image, image_path)
+        cap = _caption(src, user_input, min_pixels, max_pixels, max_new_tokens)
+        prompt = prompt_override or cap
+        out_img = _generate(src, prompt, seed, negative_prompt, guidance_scale, num_inference_steps, width, height)
+        out_path = _save(out_img)
 
-        src_image = _open_image_from_upload_or_path(image, image_path)
-        caption_text = _generate_caption(src_image, user_input, min_pixels, max_pixels, max_new_tokens)
-        final_prompt = prompt_override or caption_text
-
-        result_img = _run_zimage(
-            prompt=final_prompt,
-            init_image=src_image,
-            seed=seed,
-            negative_prompt=negative_prompt,
-            guidance_scale=guidance_scale,
-            num_inference_steps=num_inference_steps,
-            width=width,
-            height=height,
-        )
-        output_path = _save_result(result_img)
-
-    response: Dict[str, Any] = {
+    resp: Dict[str, Any] = {
         "success": True,
-        "caption_text": caption_text,
-        "final_prompt": final_prompt,
-        "result_image_path": output_path,
-        "actual_qwen_device": target_qwen_device,
-        "actual_zimage_device": target_zimage_device,
+        "caption_text": cap,
+        "final_prompt": prompt,
+        "result_image_path": out_path,
+        "actual_qwen_device": qd,
+        "actual_zimage_device": zd,
         "latency_ms": int((time.time() - start) * 1000),
-        "used_params": {
-            "seed": seed,
-            "guidance_scale": guidance_scale,
-            "num_inference_steps": num_inference_steps,
-            "width": width,
-            "height": height,
-            "max_new_tokens": max_new_tokens,
-            "min_pixels": min_pixels,
-            "max_pixels": max_pixels,
-        },
     }
     if return_base64:
-        response["result_image_base64"] = _image_to_base64(result_img)
-    return response
+        resp["result_image_base64"] = _b64(out_img)
+    return resp
 
 
 @app.post("/infer/result1_by_path")
 def infer_result1_by_path(req: InferPathRequest) -> Dict[str, Any]:
-    target_qwen_device = f"cuda:{DEFAULT_QWEN_GPU_ID if req.qwen_gpu_id is None else req.qwen_gpu_id}"
-    target_zimage_device = f"cuda:{DEFAULT_ZIMAGE_GPU_ID if req.zimage_gpu_id is None else req.zimage_gpu_id}"
-
     with _infer_lock:
-        if _state["qwen_device"] != target_qwen_device:
-            _load_qwen_model(target_qwen_device)
-        if _state["zimage_device"] != target_zimage_device:
-            _load_zimage_model(target_zimage_device)
-
-        src_image = _open_image_from_upload_or_path(None, req.image_path)
-        caption_text = _generate_caption(src_image, req.user_input, req.min_pixels, req.max_pixels, req.max_new_tokens)
-        final_prompt = req.prompt_override or caption_text
-        result_img = _run_zimage(
-            prompt=final_prompt,
-            init_image=src_image,
-            seed=req.seed,
-            negative_prompt=req.negative_prompt,
-            guidance_scale=req.guidance_scale,
-            num_inference_steps=req.num_inference_steps,
-            width=req.width,
-            height=req.height,
-        )
-        output_path = _save_result(result_img)
+        qd, zd = _resolve_devices(req.qwen_gpu_id, req.zimage_gpu_id)
+        _load_qwen(qd)
+        _load_zimage(zd)
+        src = _prepare_image(None, req.image_path)
+        cap = _caption(src, req.user_input, req.min_pixels, req.max_pixels, req.max_new_tokens)
+        prompt = req.prompt_override or cap
+        out_img = _generate(src, prompt, req.seed, req.negative_prompt, req.guidance_scale, req.num_inference_steps, req.width, req.height)
+        out_path = _save(out_img)
 
     return {
         "success": True,
-        "caption_text": caption_text,
-        "final_prompt": final_prompt,
-        "result_image_path": output_path,
-        "actual_qwen_device": target_qwen_device,
-        "actual_zimage_device": target_zimage_device,
+        "caption_text": cap,
+        "final_prompt": prompt,
+        "result_image_path": out_path,
+        "actual_qwen_device": qd,
+        "actual_zimage_device": zd,
     }
