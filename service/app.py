@@ -16,7 +16,7 @@ from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 
 BASE_DIR = Path(os.getenv("COMFYUI_BASE_DIR", "/data1/w00916456/ComfyUI"))
 RESULTS_DIR = Path(os.getenv("RESULTS_DIR", str(BASE_DIR / "results"))).resolve()
-QWEN_MODEL_PATH = os.getenv("QWEN_MODEL_PATH", "/data1/w00916456/Qwen3-VL-32B-Instruct")
+QWEN_MODEL_PATH = os.getenv("QWEN_MODEL_PATH", "/data1/w00916456/Qwen3-VL/Qwen3-VL-32B-Instruct")
 ZIMAGE_MODEL_PATH = os.getenv("ZIMAGE_MODEL_PATH", "/data1/w00916456/Z-Image-main/Z-Image-Turbo")
 DEFAULT_QWEN_GPU_ID = int(os.getenv("DEFAULT_QWEN_GPU_ID", "0"))
 DEFAULT_ZIMAGE_GPU_ID = int(os.getenv("DEFAULT_ZIMAGE_GPU_ID", "0"))
