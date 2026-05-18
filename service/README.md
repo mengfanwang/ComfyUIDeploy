@@ -6,7 +6,9 @@
 
 ## 目录约定
 
-- ComfyUI 根目录：`/data1/w00916456/ComfyUI`
+- ComfyUI 目录：`/data1/w00916456/ComfyUI`
+  - 当前仓库：`/data1/w00916456/ComfyUI/ComfyUIDeploy`
+  - 官方仓库：`/data1/w00916456/ComfyUI/ComfyUI-0.21.1`
 - 输出目录：`/data1/w00916456/ComfyUI/results`
 
 ## 安装
@@ -22,7 +24,7 @@ pip install -r service/requirements.txt
 ```bash
 export COMFYUI_BASE_DIR=/data1/w00916456/ComfyUI
 export RESULTS_DIR=/data1/w00916456/ComfyUI/results
-export QWEN_MODEL_PATH=/data1/w00916456/Qwen3-VL-32B-Instruct
+export QWEN_MODEL_PATH=/data1/w00916456/Qwen3-VL/Qwen3-VL-32B-Instruct
 export ZIMAGE_MODEL_PATH=/data1/w00916456/Z-Image-main/Z-Image-Turbo
 export DEFAULT_QWEN_GPU_ID=0
 export DEFAULT_ZIMAGE_GPU_ID=1
