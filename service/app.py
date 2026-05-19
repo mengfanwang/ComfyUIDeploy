@@ -185,15 +185,12 @@ def _run_zimage(
         "num_inference_steps": num_inference_steps,
     }
 
-    # 不同版本/实现的 ZImagePipeline 对输入图参数命名不一致
+    # Z-Image 作为 T2I 模型时不接收图像输入；若当前实现支持图像参数则兼容传入。
     # 常见命名：image / init_image / image_prompt / input_image
     image_param_candidates = ("image", "init_image", "image_prompt", "input_image")
     image_param = next((name for name in image_param_candidates if name in call_params), None)
-    if image_param is None:
-        raise RuntimeError(
-            f"ZImagePipeline.__call__ does not accept image inputs. signature={call_sig}"
-        )
-    kwargs[image_param] = init_image
+    if image_param is not None:
+        kwargs[image_param] = init_image
     if negative_prompt and "negative_prompt" in call_params:
         kwargs["negative_prompt"] = negative_prompt
     if width and "width" in call_params:
