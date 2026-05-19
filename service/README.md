@@ -235,7 +235,7 @@ HTTP 节点参数：
 - Qwen 结果相关参数：
   - `user_input/min_pixels/max_pixels`
   - `max_new_tokens/min_new_tokens`
-  - `do_sample/temperature/top_p/top_k`
+  - `do_sample/temperature/top_p/top_k (只有在do_sample为True时后面几个才有用）`
   - `repetition_penalty/length_penalty/no_repeat_ngram_size`
   - `num_beams/early_stopping`
 - Z-Image 结果相关参数：
