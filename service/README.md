@@ -1,29 +1,99 @@
 # Result1 Inference API (Qwen3-VL-32B-Instruct + Z-Image-Turbo)
 
-该服务用于最小化打通 `结果1` 通路：
+本 README 提供**从 0 开始**的完整部署步骤，适用于：
 
-`输入图像 -> Qwen3-VL 生成描述 -> Z-Image-Turbo 生成结果图 -> 保存到 ./results`
+- 你只有自己的基础镜像（例如 `knowbase:0.0.4`）
+- 还没有 ComfyUI
+- 还没有 Python 推理接口
+- 还没有 HTTP 服务
 
-## 目录约定
+目标是打通：
 
-- ComfyUI 目录：`/data1/w00916456/ComfyUI`
-  - 当前仓库：`/data1/w00916456/ComfyUI/ComfyUIDeploy`
-  - 官方仓库：`/data1/w00916456/ComfyUI/ComfyUI-0.21.1`
-- 输出目录：`/data1/w00916456/ComfyUI/results`
+`输入图像 -> Qwen3-VL 生成描述 -> Z-Image-Turbo 生成图 -> 保存到 /data1/w00916456/ComfyUI/ComfyUIDeploy/results`
 
-## 安装
+---
+
+## 0. 前置假设
+
+- 服务器可用 NVIDIA GPU（如 A100）
+- 宿主机已安装可用的 NVIDIA Driver + Docker + nvidia-container-runtime
+- 模型已在宿主机目录：
+  - `/data1/w00916456/Qwen3-VL/Qwen3-VL-32B-Instruct`
+  - `/data1/w00916456/Z-Image-main/Z-Image-Turbo`
+
+---
+
+## 1. 启动你的基础容器
 
 ```bash
+sudo docker run -it --name knowbase_result1 \
+  --gpus all \
+  -p 39188:39188 \
+  -p 38188:38188 \
+  -v /data1/w00916456:/data1/w00916456 \
+  knowbase:0.0.4
+```
+
+说明：
+- `39188` 用于 ComfyUI Web UI。
+- `38188` 用于本项目推理 API。
+
+---
+
+## 2. 在容器内准备目录
+
+```bash
+mkdir -p /data1/w00916456/ComfyUI
+mkdir -p /data1/w00916456/ComfyUI/ComfyUIDeploy/results
+```
+
+---
+
+## 3. 从官方仓库部署 ComfyUI（从 0 开始必须做）
+
+```bash
+cd /data1/w00916456/ComfyUI
+# 如首次部署到固定目录 ComfyUI-0.21.1
+git clone https://github.com/comfyanonymous/ComfyUI.git ComfyUI-0.21.1
+# 若目录已存在则更新
+# cd ComfyUI-0.21.1 && git pull
+```
+
+安装依赖：
+
+```bash
+cd /data1/w00916456/ComfyUI/ComfyUI-0.21.1
+pip install -r requirements.txt
+```
+
+启动 ComfyUI：
+
+```bash
+cd /data1/w00916456/ComfyUI/ComfyUI-0.21.1
+python main.py --listen 0.0.0.0 --port 39188
+```
+
+访问：`http://<服务器IP>:39188`
+
+---
+
+## 4. 部署本仓库的 Python 推理 API
+
+> 假设本仓库代码在容器内可见路径 `/data1/w00916456/ComfyUI/ComfyUIDeploy`。
+
+安装依赖：
+
+```bash
+cd /data1/w00916456/ComfyUI/ComfyUIDeploy
 pip install -r service/requirements.txt
 ```
 
-## 启动
-
-推荐端口：`38188`（避开常见 8188 冲突）
+设置环境变量并启动：
 
 ```bash
-export COMFYUI_BASE_DIR=/data1/w00916456/ComfyUI
-export RESULTS_DIR=/data1/w00916456/ComfyUI/results
+cd /data1/w00916456/ComfyUI/ComfyUIDeploy
+export COMFYUI_BASE_DIR=/data1/w00916456/ComfyUI/ComfyUIDeploy
+export RESULTS_DIR=/data1/w00916456/ComfyUI/ComfyUIDeploy/results
 export QWEN_MODEL_PATH=/data1/w00916456/Qwen3-VL/Qwen3-VL-32B-Instruct
 export ZIMAGE_MODEL_PATH=/data1/w00916456/Z-Image-main/Z-Image-Turbo
 export DEFAULT_QWEN_GPU_ID=0
@@ -31,68 +101,111 @@ export DEFAULT_ZIMAGE_GPU_ID=1
 uvicorn service.app:app --host 0.0.0.0 --port 38188
 ```
 
-## 接口
-
-- `GET /health`
-- `POST /infer/result1`：支持上传文件 或 `image_path`
-- `POST /infer/result1_by_path`：JSON 方式按路径传图
-
-### 关键参数
-
-- `qwen_gpu_id`: Qwen3-VL 使用的 GPU
-- `zimage_gpu_id`: Z-Image-Turbo 使用的 GPU
-- `max_new_tokens`: Qwen 生成长度（默认 1024，可调）
-- `seed/guidance_scale/num_inference_steps/width/height/negative_prompt`: Z-Image 参数
-
-### 示例：文件上传
+健康检查：
 
 ```bash
-curl -X POST 'http://127.0.0.1:38188/infer/result1' \
-  -F 'image=@/data1/w00916456/test.png' \
-  -F 'user_input=请详细描述图像风格并生成重绘提示词' \
-  -F 'qwen_gpu_id=0' \
-  -F 'zimage_gpu_id=1' \
-  -F 'seed=42' \
-  -F 'guidance_scale=1.0' \
-  -F 'num_inference_steps=4' \
-  -F 'max_new_tokens=1024'
+curl http://127.0.0.1:38188/health
 ```
 
-### 示例：路径输入
+---
+
+## 5. 验证 API（先不经过 ComfyUI）
+
+### 5.1 用 `image_path` 调用（推荐先测）
 
 ```bash
 curl -X POST 'http://127.0.0.1:38188/infer/result1' \
   -F 'image_path=/data1/w00916456/test.png' \
-  -F 'qwen_gpu_id=0' -F 'zimage_gpu_id=1'
+  -F 'user_input=请详细描述图像风格并生成重绘提示词' \
+  -F 'qwen_gpu_id=0' \
+  -F 'zimage_gpu_id=1' \
+  -F 'max_new_tokens=1024' \
+  -F 'seed=42' \
+  -F 'guidance_scale=1.0' \
+  -F 'num_inference_steps=4'
 ```
 
-## ComfyUI 快速对接（API 被 ComfyUI 调用）
+### 5.2 文件上传调用
 
-> 目标：在 ComfyUI Web UI 中一键调用 `/infer/result1`。
+```bash
+curl -X POST 'http://127.0.0.1:38188/infer/result1' \
+  -F 'image=@/data1/w00916456/test.png' \
+  -F 'qwen_gpu_id=0' \
+  -F 'zimage_gpu_id=1'
+```
 
-### 方案A（推荐，最快）：HTTP Request 节点
+成功后会在 `/data1/w00916456/ComfyUI/ComfyUIDeploy/results` 看到结果图。
 
-1. 在 ComfyUI 安装支持 HTTP POST 的自定义节点（常见 HTTP Request/REST 节点均可）。
-2. 节点配置：
-   - Method: `POST`
-   - URL: `http://127.0.0.1:38188/infer/result1`（若 API 与 ComfyUI 在同容器）
-   - Content-Type: `multipart/form-data`
-3. 表单字段映射：
-   - `image` <- ComfyUI 的 LoadImage 输出文件
-   - `user_input` <- 文本输入节点
-   - `qwen_gpu_id` <- 整数参数节点（如 0）
-   - `zimage_gpu_id` <- 整数参数节点（如 1）
-   - `max_new_tokens` / `seed` / `guidance_scale` / `num_inference_steps` 等 <- 参数节点
-4. 解析返回 JSON 的 `result_image_path`，再用 LoadImage(From Path) 节点加载结果图显示。
+---
 
-### 方案B（无需安装节点）：在 ComfyUI 的 Python 自定义节点里直接 requests.post
+## 6. 在 ComfyUI 安装 HTTP POST 自定义节点
 
-- 在自定义节点中将 ComfyUI 输入图保存到临时文件；
-- 调用 `POST /infer/result1` 传 `image_path` 与参数；
-- 从返回的 `result_image_path` 读图回传给下游节点。
+在 ComfyUI 目录执行（示例流程）：
 
-## 说明
+```bash
+cd /data1/w00916456/ComfyUI/ComfyUI-0.21.1/custom_nodes
+# 选择并安装一个支持 HTTP/REST 的节点仓库
+# git clone <某个HTTP节点仓库地址>
+```
 
-- 模型在服务启动时加载一次，不会每请求重复 `from_pretrained`。
-- Qwen 与 Z-Image 可在不同 GPU 上运行（分别由 `qwen_gpu_id` 和 `zimage_gpu_id` 指定）。
-- 若请求时切换到新 GPU，会触发对应模型重载（耗时较高）；生产建议固定 GPU 实例化服务。
+安装该节点依赖（若仓库提供 requirements）：
+
+```bash
+# cd <该节点目录>
+# pip install -r requirements.txt
+```
+
+重启 ComfyUI。
+
+> 不同 HTTP 节点仓库名字不同，但你需要的能力是：
+> - 支持 POST
+> - 支持 multipart/form-data
+> - 支持解析 JSON 响应
+
+---
+
+## 7. 在 ComfyUI 中配置调用 `/infer/result1`（image_path 方式）
+
+HTTP 节点参数：
+
+- Method: `POST`
+- URL: `http://127.0.0.1:38188/infer/result1`
+- Content-Type: `multipart/form-data`
+- Form fields:
+  - `image_path`: `/data1/w00916456/test.png`（或上游节点拼出的路径）
+  - `user_input`: 文本提示
+  - `qwen_gpu_id`: `0`
+  - `zimage_gpu_id`: `1`
+  - `max_new_tokens`: `1024`
+  - `seed`: `42`
+  - `guidance_scale`: `1.0`
+  - `num_inference_steps`: `4`
+
+解析 JSON 返回中的 `result_image_path`，再接“按路径读图节点”进行展示。
+
+---
+
+## 8. 接口说明
+
+- `GET /health`
+- `POST /infer/result1`：支持上传文件或 `image_path`（二选一）
+- `POST /infer/result1_by_path`：JSON 方式按路径传图
+
+关键参数：
+
+- `qwen_gpu_id`: Qwen3-VL 使用 GPU
+- `zimage_gpu_id`: Z-Image-Turbo 使用 GPU
+- `max_new_tokens`: Qwen 输出长度（可调）
+- `seed/guidance_scale/num_inference_steps/width/height/negative_prompt`: Z-Image 参数
+
+---
+
+## 9. 常见问题
+
+1. **为什么第一次慢？**
+   - 模型首次加载很重，尤其 Qwen3-VL-32B。
+2. **为什么切换 GPU 会更慢？**
+   - 切换 `qwen_gpu_id` 或 `zimage_gpu_id` 会触发该模型重载。
+3. **是否每次请求都加载模型？**
+   - 不会，服务启动后常驻内存；仅在切 GPU 时重载。
+
