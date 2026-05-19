@@ -6,7 +6,7 @@ import time
 import uuid
 from pathlib import Path
 from threading import Lock
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 from diffusers import ZImagePipeline
@@ -36,21 +36,38 @@ _infer_lock = Lock()
 
 
 class InferPathRequest(BaseModel):
-    image_path: str
+    mode: str = Field(default="e2e")
+    image_path: Optional[str] = None
     user_input: str = Field(default="Describe this image for re-generation.")
     min_pixels: int = 117600
     max_pixels: int = 786432
     max_new_tokens: int = 1024
+    min_new_tokens: Optional[int] = None
+    do_sample: bool = False
+    temperature: Optional[float] = None
+    top_p: Optional[float] = None
+    top_k: Optional[int] = None
+    repetition_penalty: Optional[float] = None
+    length_penalty: Optional[float] = None
+    no_repeat_ngram_size: Optional[int] = None
+    num_beams: int = 1
+    early_stopping: bool = False
     qwen_gpu_id: Optional[int] = None
     zimage_gpu_id: Optional[int] = None
 
     seed: Optional[int] = None
     prompt_override: Optional[str] = None
+    prompt: Optional[str] = None
     negative_prompt: Optional[str] = None
     guidance_scale: float = 1.0
     num_inference_steps: int = 4
     width: Optional[int] = None
     height: Optional[int] = None
+    num_images_per_prompt: int = 1
+    cfg_normalization: bool = False
+    cfg_truncation: float = 1.0
+    max_sequence_length: Optional[int] = None
+    sigmas: Optional[List[float]] = None
 
 
 def _ensure_results_dir() -> None:
@@ -124,6 +141,16 @@ def _generate_caption(
     min_pixels: int,
     max_pixels: int,
     max_new_tokens: int,
+    min_new_tokens: Optional[int],
+    do_sample: bool,
+    temperature: Optional[float],
+    top_p: Optional[float],
+    top_k: Optional[int],
+    repetition_penalty: Optional[float],
+    length_penalty: Optional[float],
+    no_repeat_ngram_size: Optional[int],
+    num_beams: int,
+    early_stopping: bool,
 ) -> str:
     processor = _state["processor"]
     qwen_model = _state["qwen_model"]
@@ -148,7 +175,28 @@ def _generate_caption(
     inputs = processor(text=[text], images=[image], return_tensors="pt")
     inputs = {k: v.to(qwen_device) if hasattr(v, "to") else v for k, v in inputs.items()}
 
-    generated_ids = qwen_model.generate(**inputs, max_new_tokens=max_new_tokens)
+    generate_kwargs: Dict[str, Any] = {
+        "max_new_tokens": max_new_tokens,
+        "do_sample": do_sample,
+        "num_beams": num_beams,
+        "early_stopping": early_stopping,
+    }
+    if min_new_tokens is not None:
+        generate_kwargs["min_new_tokens"] = min_new_tokens
+    if temperature is not None:
+        generate_kwargs["temperature"] = temperature
+    if top_p is not None:
+        generate_kwargs["top_p"] = top_p
+    if top_k is not None:
+        generate_kwargs["top_k"] = top_k
+    if repetition_penalty is not None:
+        generate_kwargs["repetition_penalty"] = repetition_penalty
+    if length_penalty is not None:
+        generate_kwargs["length_penalty"] = length_penalty
+    if no_repeat_ngram_size is not None:
+        generate_kwargs["no_repeat_ngram_size"] = no_repeat_ngram_size
+
+    generated_ids = qwen_model.generate(**inputs, **generate_kwargs)
     generated_ids_trimmed = [
         out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs["input_ids"], generated_ids)
     ]
@@ -162,13 +210,17 @@ def _generate_caption(
 
 def _run_zimage(
     prompt: str,
-    init_image: Image.Image,
     seed: Optional[int],
     negative_prompt: Optional[str],
     guidance_scale: float,
     num_inference_steps: int,
     width: Optional[int],
     height: Optional[int],
+    num_images_per_prompt: int,
+    cfg_normalization: bool,
+    cfg_truncation: float,
+    max_sequence_length: Optional[int],
+    sigmas: Optional[List[float]],
 ) -> Image.Image:
     pipe = _state["zimage_pipe"]
     zimage_device = _state["zimage_device"]
@@ -184,20 +236,21 @@ def _run_zimage(
         "prompt": prompt,
         "guidance_scale": guidance_scale,
         "num_inference_steps": num_inference_steps,
+        "num_images_per_prompt": num_images_per_prompt,
+        "cfg_normalization": cfg_normalization,
+        "cfg_truncation": cfg_truncation,
     }
 
-    # Z-Image 作为 T2I 模型时不接收图像输入；若当前实现支持图像参数则兼容传入。
-    # 常见命名：image / init_image / image_prompt / input_image
-    image_param_candidates = ("image", "init_image", "image_prompt", "input_image")
-    image_param = next((name for name in image_param_candidates if name in call_params), None)
-    if image_param is not None:
-        kwargs[image_param] = init_image
     if negative_prompt and "negative_prompt" in call_params:
         kwargs["negative_prompt"] = negative_prompt
     if width and "width" in call_params:
         kwargs["width"] = width
     if height and "height" in call_params:
         kwargs["height"] = height
+    if max_sequence_length is not None and "max_sequence_length" in call_params:
+        kwargs["max_sequence_length"] = max_sequence_length
+    if sigmas is not None and "sigmas" in call_params:
+        kwargs["sigmas"] = sigmas
     if generator is not None and "generator" in call_params:
         kwargs["generator"] = generator
 
@@ -225,21 +278,38 @@ def _image_to_base64(image: Image.Image) -> str:
 
 @app.post("/infer/result1")
 def infer_result1(
+    mode: str = Form(default="e2e"),
     image: Optional[UploadFile] = File(default=None),
     image_path: Optional[str] = Form(default=None),
     user_input: str = Form(default="Describe this image for re-generation."),
     min_pixels: int = Form(default=117600),
     max_pixels: int = Form(default=786432),
     max_new_tokens: int = Form(default=1024),
+    min_new_tokens: Optional[int] = Form(default=None),
+    do_sample: bool = Form(default=False),
+    temperature: Optional[float] = Form(default=None),
+    top_p: Optional[float] = Form(default=None),
+    top_k: Optional[int] = Form(default=None),
+    repetition_penalty: Optional[float] = Form(default=None),
+    length_penalty: Optional[float] = Form(default=None),
+    no_repeat_ngram_size: Optional[int] = Form(default=None),
+    num_beams: int = Form(default=1),
+    early_stopping: bool = Form(default=False),
     qwen_gpu_id: Optional[int] = Form(default=None),
     zimage_gpu_id: Optional[int] = Form(default=None),
     seed: Optional[int] = Form(default=None),
     prompt_override: Optional[str] = Form(default=None),
+    prompt: Optional[str] = Form(default=None),
     negative_prompt: Optional[str] = Form(default=None),
     guidance_scale: float = Form(default=1.0),
     num_inference_steps: int = Form(default=4),
     width: Optional[int] = Form(default=None),
     height: Optional[int] = Form(default=None),
+    num_images_per_prompt: int = Form(default=1),
+    cfg_normalization: bool = Form(default=False),
+    cfg_truncation: float = Form(default=1.0),
+    max_sequence_length: Optional[int] = Form(default=None),
+    sigmas: Optional[str] = Form(default=None),
     return_base64: bool = Form(default=False),
 ) -> JSONResponse:
     start = time.time()
@@ -253,28 +323,54 @@ def infer_result1(
         if _state["zimage_device"] != target_zimage_device:
             _load_zimage_model(target_zimage_device)
 
-        src_image = _open_image_from_upload_or_path(image, image_path)
-        caption_text = _generate_caption(src_image, user_input, min_pixels, max_pixels, max_new_tokens)
-        final_prompt = prompt_override or caption_text
+        mode = mode.lower().strip()
+        if mode not in {"e2e", "qwen_only", "zimage_only"}:
+            raise HTTPException(status_code=400, detail="mode must be one of: e2e, qwen_only, zimage_only")
+        src_image: Optional[Image.Image] = None
+        if mode in {"e2e", "qwen_only"}:
+            src_image = _open_image_from_upload_or_path(image, image_path)
+        caption_text: Optional[str] = None
+        output_path: Optional[str] = None
 
-        result_img = _run_zimage(
-            prompt=final_prompt,
-            init_image=src_image,
-            seed=seed,
-            negative_prompt=negative_prompt,
-            guidance_scale=guidance_scale,
-            num_inference_steps=num_inference_steps,
-            width=width,
-            height=height,
-        )
-        output_path = _save_result(result_img)
+        sigma_values: Optional[List[float]] = None
+        if sigmas:
+            sigma_values = [float(s.strip()) for s in sigmas.split(",") if s.strip()]
+
+        if mode in {"e2e", "qwen_only"}:
+            assert src_image is not None
+            caption_text = _generate_caption(
+                src_image, user_input, min_pixels, max_pixels, max_new_tokens, min_new_tokens, do_sample,
+                temperature, top_p, top_k, repetition_penalty, length_penalty, no_repeat_ngram_size, num_beams,
+                early_stopping
+            )
+
+        final_prompt = prompt_override or prompt or caption_text
+        if mode in {"e2e", "zimage_only"}:
+            if not final_prompt:
+                raise HTTPException(status_code=400, detail="prompt or prompt_override is required for zimage_only")
+            result_img = _run_zimage(
+                prompt=final_prompt,
+                seed=seed,
+                negative_prompt=negative_prompt,
+                guidance_scale=guidance_scale,
+                num_inference_steps=num_inference_steps,
+                width=width,
+                height=height,
+                num_images_per_prompt=num_images_per_prompt,
+                cfg_normalization=cfg_normalization,
+                cfg_truncation=cfg_truncation,
+                max_sequence_length=max_sequence_length,
+                sigmas=sigma_values,
+            )
+            output_path = _save_result(result_img)
 
     response: Dict[str, Any] = {
         "success": True,
+        "mode": mode,
         "caption_text": caption_text,
         "final_prompt": final_prompt,
         "result_image_path": output_path,
-        "result_image_url": _build_result_image_url(output_path),
+        "result_image_url": _build_result_image_url(output_path) if output_path else None,
         "actual_qwen_device": target_qwen_device,
         "actual_zimage_device": target_zimage_device,
         "latency_ms": int((time.time() - start) * 1000),
@@ -285,11 +381,26 @@ def infer_result1(
             "width": width,
             "height": height,
             "max_new_tokens": max_new_tokens,
+            "min_new_tokens": min_new_tokens,
+            "do_sample": do_sample,
+            "temperature": temperature,
+            "top_p": top_p,
+            "top_k": top_k,
+            "repetition_penalty": repetition_penalty,
+            "length_penalty": length_penalty,
+            "no_repeat_ngram_size": no_repeat_ngram_size,
+            "num_beams": num_beams,
+            "early_stopping": early_stopping,
             "min_pixels": min_pixels,
             "max_pixels": max_pixels,
+            "num_images_per_prompt": num_images_per_prompt,
+            "cfg_normalization": cfg_normalization,
+            "cfg_truncation": cfg_truncation,
+            "max_sequence_length": max_sequence_length,
+            "sigmas": sigma_values,
         },
     }
-    if return_base64:
+    if return_base64 and output_path is not None:
         response["result_image_base64"] = _image_to_base64(result_img)
     return JSONResponse(content=response, media_type="application/json; charset=utf-8")
 
@@ -305,27 +416,48 @@ def infer_result1_by_path(req: InferPathRequest) -> JSONResponse:
         if _state["zimage_device"] != target_zimage_device:
             _load_zimage_model(target_zimage_device)
 
-        src_image = _open_image_from_upload_or_path(None, req.image_path)
-        caption_text = _generate_caption(src_image, req.user_input, req.min_pixels, req.max_pixels, req.max_new_tokens)
-        final_prompt = req.prompt_override or caption_text
-        result_img = _run_zimage(
-            prompt=final_prompt,
-            init_image=src_image,
-            seed=req.seed,
-            negative_prompt=req.negative_prompt,
-            guidance_scale=req.guidance_scale,
-            num_inference_steps=req.num_inference_steps,
-            width=req.width,
-            height=req.height,
-        )
-        output_path = _save_result(result_img)
+        mode = req.mode.lower().strip()
+        if mode not in {"e2e", "qwen_only", "zimage_only"}:
+            raise HTTPException(status_code=400, detail="mode must be one of: e2e, qwen_only, zimage_only")
+        src_image: Optional[Image.Image] = None
+        if mode in {"e2e", "qwen_only"}:
+            src_image = _open_image_from_upload_or_path(None, req.image_path)
+        caption_text: Optional[str] = None
+        output_path: Optional[str] = None
+        if mode in {"e2e", "qwen_only"}:
+            assert src_image is not None
+            caption_text = _generate_caption(
+                src_image, req.user_input, req.min_pixels, req.max_pixels, req.max_new_tokens, req.min_new_tokens,
+                req.do_sample, req.temperature, req.top_p, req.top_k, req.repetition_penalty, req.length_penalty,
+                req.no_repeat_ngram_size, req.num_beams, req.early_stopping
+            )
+        final_prompt = req.prompt_override or req.prompt or caption_text
+        if mode in {"e2e", "zimage_only"}:
+            if not final_prompt:
+                raise HTTPException(status_code=400, detail="prompt or prompt_override is required for zimage_only")
+            result_img = _run_zimage(
+                prompt=final_prompt,
+                seed=req.seed,
+                negative_prompt=req.negative_prompt,
+                guidance_scale=req.guidance_scale,
+                num_inference_steps=req.num_inference_steps,
+                width=req.width,
+                height=req.height,
+                num_images_per_prompt=req.num_images_per_prompt,
+                cfg_normalization=req.cfg_normalization,
+                cfg_truncation=req.cfg_truncation,
+                max_sequence_length=req.max_sequence_length,
+                sigmas=req.sigmas,
+            )
+            output_path = _save_result(result_img)
 
     response = {
         "success": True,
+        "mode": mode,
         "caption_text": caption_text,
         "final_prompt": final_prompt,
         "result_image_path": output_path,
-        "result_image_url": _build_result_image_url(output_path),
+        "result_image_url": _build_result_image_url(output_path) if output_path else None,
         "actual_qwen_device": target_qwen_device,
         "actual_zimage_device": target_zimage_device,
     }
