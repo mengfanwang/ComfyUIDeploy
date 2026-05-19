@@ -7,9 +7,13 @@
 - 还没有 Python 推理接口
 - 还没有 HTTP 服务
 
-目标是打通：
+目标是打通并支持解耦：
 
-`输入图像 -> Qwen3-VL 生成描述 -> Z-Image-Turbo 生成图 -> 保存到 /data1/w00916456/ComfyUI/ComfyUIDeploy/results`
+- `e2e`: 输入图像 -> Qwen3-VL 生成描述 -> Z-Image-Turbo 生成图
+- `qwen_only`: 仅输入图像 -> 输出描述文本
+- `zimage_only`: 仅输入 prompt -> Z-Image-Turbo 生成图
+
+输出图保存到 `/data1/w00916456/ComfyUI/ComfyUIDeploy/results`。
 
 ---
 
@@ -111,11 +115,12 @@ curl http://127.0.0.1:38188/health
 
 ## 5. 验证 API（先不经过 ComfyUI）
 
-### 5.1 用 `image_path` 调用（推荐先测）
+### 5.1 `e2e`（默认）用 `image_path` 调用（推荐先测）
 
 ```bash
 curl -X POST 'http://127.0.0.1:38188/infer/result1' \
   -F 'image_path=/data1/w00916456/test.png' \
+  -F 'mode=e2e' \
   -F 'user_input=请详细描述图像风格并生成重绘提示词' \
   -F 'qwen_gpu_id=0' \
   -F 'zimage_gpu_id=1' \
@@ -130,11 +135,43 @@ curl -X POST 'http://127.0.0.1:38188/infer/result1' \
 ```bash
 curl -X POST 'http://127.0.0.1:38188/infer/result1' \
   -F 'image=@/data1/w00916456/test.png' \
+  -F 'mode=e2e' \
   -F 'qwen_gpu_id=0' \
   -F 'zimage_gpu_id=1'
 ```
 
 成功后会在 `/data1/w00916456/ComfyUI/ComfyUIDeploy/results` 看到结果图。
+
+### 5.3 `qwen_only`（只跑 Qwen）
+
+```bash
+curl -X POST 'http://127.0.0.1:38188/infer/result1' \
+  -F 'mode=qwen_only' \
+  -F 'image_path=/data1/w00916456/test.png' \
+  -F 'user_input=请详细描述图像风格并生成重绘提示词' \
+  -F 'max_new_tokens=1024' \
+  -F 'do_sample=false' \
+  -F 'num_beams=1'
+```
+
+返回中 `caption_text` 有值，`result_image_path/result_image_url` 为空。
+
+### 5.4 `zimage_only`（只跑 Z-Image）
+
+```bash
+curl -X POST 'http://127.0.0.1:38188/infer/result1' \
+  -F 'mode=zimage_only' \
+  -F 'prompt=cinematic portrait, soft light, ultra detailed' \
+  -F 'negative_prompt=blurry, low quality' \
+  -F 'seed=42' \
+  -F 'guidance_scale=1.0' \
+  -F 'num_inference_steps=4' \
+  -F 'num_images_per_prompt=1' \
+  -F 'cfg_normalization=false' \
+  -F 'cfg_truncation=1.0'
+```
+
+`zimage_only` 不需要输入图像；只要 `prompt` 或 `prompt_override`。
 
 ---
 
@@ -164,7 +201,7 @@ cd /data1/w00916456/ComfyUI/ComfyUI-0.21.1/custom_nodes
 
 ---
 
-## 7. 在 ComfyUI 中配置调用 `/infer/result1`（image_path 方式）
+## 7. 在 ComfyUI 中配置调用 `/infer/result1`
 
 HTTP 节点参数：
 
@@ -172,14 +209,13 @@ HTTP 节点参数：
 - URL: `http://127.0.0.1:38188/infer/result1`
 - Content-Type: `multipart/form-data`
 - Form fields:
-  - `image_path`: `/data1/w00916456/test.png`（或上游节点拼出的路径）
-  - `user_input`: 文本提示
-  - `qwen_gpu_id`: `0`
-  - `zimage_gpu_id`: `1`
-  - `max_new_tokens`: `1024`
-  - `seed`: `42`
-  - `guidance_scale`: `1.0`
-  - `num_inference_steps`: `4`
+  - `mode`: `e2e` / `qwen_only` / `zimage_only`
+  - `image_path`: `e2e` 和 `qwen_only` 必填
+  - `prompt` 或 `prompt_override`: `zimage_only` 必填其一
+  - `user_input`, `min_pixels`, `max_pixels`
+  - `max_new_tokens`, `min_new_tokens`, `do_sample`, `temperature`, `top_p`, `top_k`, `repetition_penalty`, `length_penalty`, `no_repeat_ngram_size`, `num_beams`, `early_stopping`
+  - `negative_prompt`, `guidance_scale`, `num_inference_steps`, `width`, `height`, `num_images_per_prompt`, `cfg_normalization`, `cfg_truncation`, `max_sequence_length`, `sigmas`
+  - `seed`, `qwen_gpu_id`, `zimage_gpu_id`
 
 解析 JSON 返回中的 `result_image_path`，再接“按路径读图节点”进行展示。
 
@@ -195,8 +231,18 @@ HTTP 节点参数：
 
 - `qwen_gpu_id`: Qwen3-VL 使用 GPU
 - `zimage_gpu_id`: Z-Image-Turbo 使用 GPU
-- `max_new_tokens`: Qwen 输出长度（可调）
-- `seed/guidance_scale/num_inference_steps/width/height/negative_prompt`: Z-Image 参数
+- `mode`: `e2e` / `qwen_only` / `zimage_only`
+- Qwen 结果相关参数：
+  - `user_input/min_pixels/max_pixels`
+  - `max_new_tokens/min_new_tokens`
+  - `do_sample/temperature/top_p/top_k`
+  - `repetition_penalty/length_penalty/no_repeat_ngram_size`
+  - `num_beams/early_stopping`
+- Z-Image 结果相关参数：
+  - `prompt(prompt_override)/negative_prompt`
+  - `seed/guidance_scale/num_inference_steps/width/height`
+  - `num_images_per_prompt/cfg_normalization/cfg_truncation`
+  - `max_sequence_length/sigmas`（`sigmas` 在 form 里用逗号分隔字符串传递）
 
 ---
 
@@ -208,4 +254,3 @@ HTTP 节点参数：
    - 切换 `qwen_gpu_id` 或 `zimage_gpu_id` 会触发该模型重载。
 3. **是否每次请求都加载模型？**
    - 不会，服务启动后常驻内存；仅在切 GPU 时重载。
-
