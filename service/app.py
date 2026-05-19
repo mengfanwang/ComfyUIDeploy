@@ -11,6 +11,7 @@ from typing import Any, Dict, Optional
 import torch
 from diffusers import ZImagePipeline
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.responses import FileResponse, JSONResponse
 from PIL import Image
 from pydantic import BaseModel, Field
 from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
@@ -211,6 +212,11 @@ def _save_result(image: Image.Image) -> str:
     return str(output_path)
 
 
+def _build_result_image_url(output_path: str) -> str:
+    filename = Path(output_path).name
+    return f"/results/{filename}"
+
+
 def _image_to_base64(image: Image.Image) -> str:
     buff = io.BytesIO()
     image.save(buff, format="PNG")
@@ -235,7 +241,7 @@ def infer_result1(
     width: Optional[int] = Form(default=None),
     height: Optional[int] = Form(default=None),
     return_base64: bool = Form(default=False),
-) -> Dict[str, Any]:
+) -> JSONResponse:
     start = time.time()
 
     target_qwen_device = f"cuda:{DEFAULT_QWEN_GPU_ID if qwen_gpu_id is None else qwen_gpu_id}"
@@ -268,6 +274,7 @@ def infer_result1(
         "caption_text": caption_text,
         "final_prompt": final_prompt,
         "result_image_path": output_path,
+        "result_image_url": _build_result_image_url(output_path),
         "actual_qwen_device": target_qwen_device,
         "actual_zimage_device": target_zimage_device,
         "latency_ms": int((time.time() - start) * 1000),
@@ -284,11 +291,11 @@ def infer_result1(
     }
     if return_base64:
         response["result_image_base64"] = _image_to_base64(result_img)
-    return response
+    return JSONResponse(content=response, media_type="application/json; charset=utf-8")
 
 
 @app.post("/infer/result1_by_path")
-def infer_result1_by_path(req: InferPathRequest) -> Dict[str, Any]:
+def infer_result1_by_path(req: InferPathRequest) -> JSONResponse:
     target_qwen_device = f"cuda:{DEFAULT_QWEN_GPU_ID if req.qwen_gpu_id is None else req.qwen_gpu_id}"
     target_zimage_device = f"cuda:{DEFAULT_ZIMAGE_GPU_ID if req.zimage_gpu_id is None else req.zimage_gpu_id}"
 
@@ -313,11 +320,24 @@ def infer_result1_by_path(req: InferPathRequest) -> Dict[str, Any]:
         )
         output_path = _save_result(result_img)
 
-    return {
+    response = {
         "success": True,
         "caption_text": caption_text,
         "final_prompt": final_prompt,
         "result_image_path": output_path,
+        "result_image_url": _build_result_image_url(output_path),
         "actual_qwen_device": target_qwen_device,
         "actual_zimage_device": target_zimage_device,
     }
+    return JSONResponse(content=response, media_type="application/json; charset=utf-8")
+
+
+@app.get("/results/{filename}")
+def get_result_image(filename: str) -> FileResponse:
+    safe_name = Path(filename).name
+    image_path = (RESULTS_DIR / safe_name).resolve()
+    if not str(image_path).startswith(str(RESULTS_DIR)):
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    if not image_path.exists() or not image_path.is_file():
+        raise HTTPException(status_code=404, detail="Image not found")
+    return FileResponse(path=image_path, media_type="image/png", filename=safe_name)
