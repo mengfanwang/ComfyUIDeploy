@@ -1,5 +1,6 @@
 import base64
 import io
+import inspect
 import os
 import time
 import uuid
@@ -175,19 +176,31 @@ def _run_zimage(
     if seed is not None:
         generator = torch.Generator(device=zimage_device).manual_seed(seed)
 
+    call_sig = inspect.signature(pipe.__call__)
+    call_params = set(call_sig.parameters.keys())
+
     kwargs: Dict[str, Any] = {
         "prompt": prompt,
-        "image": init_image,
         "guidance_scale": guidance_scale,
         "num_inference_steps": num_inference_steps,
     }
-    if negative_prompt:
+
+    # 不同版本/实现的 ZImagePipeline 对输入图参数命名不一致
+    # 常见命名：image / init_image / image_prompt / input_image
+    image_param_candidates = ("image", "init_image", "image_prompt", "input_image")
+    image_param = next((name for name in image_param_candidates if name in call_params), None)
+    if image_param is None:
+        raise RuntimeError(
+            f"ZImagePipeline.__call__ does not accept image inputs. signature={call_sig}"
+        )
+    kwargs[image_param] = init_image
+    if negative_prompt and "negative_prompt" in call_params:
         kwargs["negative_prompt"] = negative_prompt
-    if width:
+    if width and "width" in call_params:
         kwargs["width"] = width
-    if height:
+    if height and "height" in call_params:
         kwargs["height"] = height
-    if generator is not None:
+    if generator is not None and "generator" in call_params:
         kwargs["generator"] = generator
 
     out = pipe(**kwargs)
